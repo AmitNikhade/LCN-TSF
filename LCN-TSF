@@ -1,0 +1,269 @@
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Load the Air Passengers dataset
+url = 'https://raw.githubusercontent.com/jbrownlee/Datasets/master/airline-passengers.csv'
+df = pd.read_csv(url, parse_dates=['Month'], index_col='Month')
+
+# Normalize the data
+scaler = MinMaxScaler()
+scaled_data = scaler.fit_transform(df)
+
+# Create sequences
+def create_sequences(data, seq_length, forecast_horizon):
+    X, y = [], []
+    for i in range(len(data) - seq_length - forecast_horizon + 1):
+        X.append(data[i:(i + seq_length)])
+        y.append(data[(i + seq_length):(i + seq_length + forecast_horizon)])
+    return np.array(X), np.array(y)
+
+# Set parameters
+sequence_length = 24
+forecast_horizon = 12
+X, y = create_sequences(scaled_data, sequence_length, forecast_horizon)
+
+# Split the data into train and test sets
+train_size = int(len(X) * 0.8)
+X_train, X_test = X[:train_size], X[train_size:]
+y_train, y_test = y[:train_size], y[train_size:]
+
+# Convert to PyTorch tensors
+X_train = torch.FloatTensor(X_train)
+y_train = torch.FloatTensor(y_train)
+X_test = torch.FloatTensor(X_test)
+y_test = torch.FloatTensor(y_test)
+
+# Create DataLoaders
+train_dataset = TensorDataset(X_train, y_train)
+test_dataset = TensorDataset(X_test, y_test)
+batch_size = 16
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+class LIF(nn.Module):
+    def __init__(self, tau_mem, tau_syn, threshold):
+        super(LIF, self).__init__()
+        self.tau_mem = torch.tensor(tau_mem)
+        self.tau_syn = torch.tensor(tau_syn)
+        self.threshold = torch.tensor(threshold)
+
+    def forward(self, x, mem, syn):
+        mem = mem * torch.exp(-1 / self.tau_mem) + x * (1 - torch.exp(-1 / self.tau_syn))
+        spikes = (mem > self.threshold).float()
+        mem = mem * (1 - spikes)
+        syn = syn * torch.exp(-1 / self.tau_syn) + spikes
+        return spikes, mem, syn
+
+class LSM(nn.Module):
+    def __init__(self, input_size, liquid_size, output_size, tau_mem, tau_syn, threshold):
+        super(LSM, self).__init__()
+        self.input_size = input_size
+        self.liquid_size = liquid_size
+        self.output_size = output_size
+        self.lif_neuron = LIF(tau_mem, tau_syn, threshold)
+        self.W_in = nn.Parameter(torch.rand(liquid_size, input_size) - 0.5)
+        self.W_liq = nn.Parameter(torch.rand(liquid_size, liquid_size) - 0.5)
+        self.W_out = nn.Parameter(torch.zeros(output_size, liquid_size))
+
+    def forward(self, x, mem=None, syn=None):
+        batch_size, seq_len, _ = x.size()
+        if mem is None:
+            mem = torch.zeros(batch_size, self.liquid_size).to(x.device)
+        if syn is None:
+            syn = torch.zeros(batch_size, self.liquid_size).to(x.device)
+
+        outputs = []
+        for t in range(seq_len):
+            x_t = x[:, t, :]
+            spikes, mem, syn = self.lif_neuron(torch.matmul(x_t, self.W_in.t()) + torch.matmul(syn, self.W_liq.t()), mem, syn)
+            output = torch.matmul(spikes, self.W_out.t())
+            outputs.append(output)
+
+        return torch.stack(outputs, dim=1), mem, syn
+
+class CapsuleConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        super(CapsuleConv1d, self).__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels * 8, kernel_size=kernel_size, stride=stride, padding=padding)
+        self.out_channels = out_channels
+
+    def squash(self, x):
+        squared_norm = (x ** 2).sum(dim=-1, keepdim=True)
+        scale = squared_norm / (1 + squared_norm)
+        return scale * x / torch.sqrt(squared_norm + 1e-8)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x.view(x.size(0), x.size(2), self.out_channels, 8)
+        x = self.squash(x)
+        return x
+
+class CapsuleLayer(nn.Module):
+    def __init__(self, in_capsules, out_capsules, in_dim, out_dim, num_routing=3):
+        super(CapsuleLayer, self).__init__()
+        self.num_routing = num_routing
+        self.in_capsules = in_capsules
+        self.out_capsules = out_capsules
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.W = nn.Parameter(torch.randn(1, 1, out_capsules, in_capsules, out_dim, in_dim))
+
+    def squash(self, x):
+        squared_norm = (x ** 2).sum(dim=-1, keepdim=True)
+        scale = squared_norm / (1 + squared_norm)
+        return scale * x / torch.sqrt(squared_norm + 1e-8)
+
+    def forward(self, x):
+        batch_size, seq_len, in_capsules, in_dim = x.shape
+        x = x.unsqueeze(2).unsqueeze(5)
+        u_hat = torch.matmul(self.W, x).squeeze(-1)
+
+        b_ij = torch.zeros(batch_size, seq_len, self.out_capsules, in_capsules).to(x.device)
+
+        for _ in range(self.num_routing):
+            c_ij = F.softmax(b_ij, dim=2)
+            s_j = (c_ij.unsqueeze(-1) * u_hat).sum(dim=3)
+            v_j = self.squash(s_j)
+            if _ < self.num_routing - 1:
+                agreement = torch.sum(u_hat * v_j.unsqueeze(3), dim=-1)
+                b_ij = b_ij + agreement
+
+        return v_j
+
+class Encoder(nn.Module):
+    def __init__(self, input_size, liquid_size, output_size, tau_mem, tau_syn, threshold):
+        super(Encoder, self).__init__()
+        self.lsm = LSM(input_size, liquid_size, output_size, tau_mem, tau_syn, threshold)
+        self.capsule_conv = CapsuleConv1d(output_size, 32, kernel_size=3, stride=1, padding=1)
+        self.capsule_layer = CapsuleLayer(32, 16, 8, 16)
+
+    def forward(self, x, mem=None, syn=None):
+        x, mem, syn = self.lsm(x, mem, syn)
+        x = x.transpose(1, 2)
+        x = self.capsule_conv(x)
+        x = self.capsule_layer(x)
+        return x, mem, syn
+
+class Decoder(nn.Module):
+    def __init__(self, input_size, output_size, forecast_horizon):
+        super(Decoder, self).__init__()
+        self.lstm = nn.LSTM(input_size, 64, batch_first=True)
+        self.fc = nn.Linear(64, output_size)
+        self.forecast_horizon = forecast_horizon
+
+    def forward(self, x):
+        x = x.view(x.size(0), x.size(1), -1)
+        x, _ = self.lstm(x)
+        x = self.fc(x[:, -self.forecast_horizon:, :])
+        return x
+
+class TimeSeriesLiquidCapsNet(nn.Module):
+    def __init__(self, input_size, liquid_size, output_size, forecast_horizon, tau_mem, tau_syn, threshold):
+        super(TimeSeriesLiquidCapsNet, self).__init__()
+        self.encoder = Encoder(input_size, liquid_size, liquid_size, tau_mem, tau_syn, threshold)
+        self.decoder = Decoder(16 * 16, output_size, forecast_horizon)
+        self.forecast_horizon = forecast_horizon
+
+    def forward(self, x, mem=None, syn=None):
+        x, mem, syn = self.encoder(x, mem, syn)
+        x = self.decoder(x)
+        return x[:, -self.forecast_horizon:, :], mem, syn
+
+
+# Set hyperparameters
+input_size = 1
+liquid_size = 150  # Increased liquid size
+output_size = 1
+tau_mem = 20.0
+tau_syn = 5.0
+threshold = 0.5
+num_epochs = 100
+learning_rate = 0.0001
+
+# Initialize the model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = TimeSeriesLiquidCapsNet(input_size, liquid_size, output_size, forecast_horizon, tau_mem, tau_syn, threshold).to(device)
+
+criterion = nn.HuberLoss()  # Changed loss function
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+# Training loop
+train_losses = []
+val_losses = []
+
+for epoch in range(num_epochs):
+    model.train()
+    train_loss = 0
+    for batch_idx, (X_batch, y_batch) in enumerate(train_loader):
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
+        optimizer.zero_grad()
+        outputs, _, _ = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+
+        if (batch_idx + 1) % 10 == 0:
+            print(f"Epoch [{epoch+1}/{num_epochs}], Batch [{batch_idx+1}/{len(train_loader)}], Train Loss: {loss.item():.4f}")
+
+    avg_train_loss = train_loss / len(train_loader)
+    train_losses.append(avg_train_loss)
+
+    # Validation
+    model.eval()
+    val_loss = 0
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs, _, _ = model(X_batch)
+            val_loss += criterion(outputs, y_batch).item()
+
+    avg_val_loss = val_loss / len(test_loader)
+    val_losses.append(avg_val_loss)
+
+    print(f"Epoch [{epoch+1}/{num_epochs}], Average Train Loss: {avg_train_loss:.4f}, Average Val Loss: {avg_val_loss:.4f}")
+    print("-" * 80)
+
+# Plot training and validation losses
+plt.figure(figsize=(10, 5))
+plt.plot(train_losses, label='Training Loss')
+plt.plot(val_losses, label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training and Validation Losses')
+plt.legend()
+plt.show()
+
+# Make predictions
+model.eval()
+with torch.no_grad():
+    X_test_tensor = torch.FloatTensor(X_test).to(device)
+    predictions, _, _ = model(X_test_tensor)
+    predictions = predictions.cpu().numpy()
+
+# Inverse transform the predictions and actual values
+predictions_rescaled = scaler.inverse_transform(predictions.reshape(-1, 1)).reshape(predictions.shape)
+y_test_rescaled = scaler.inverse_transform(y_test.reshape(-1, 1)).reshape(y_test.shape)
+
+# Plot the results
+plt.figure(figsize=(12, 6))
+plt.plot(y_test_rescaled[0], label='Actual')
+plt.plot(predictions_rescaled[0], label='Predicted')
+plt.xlabel('Time Steps')
+plt.ylabel('Passengers')
+plt.title('Air Passengers Forecast')
+plt.legend()
+plt.show()
+
+# Calculate and print the Mean Absolute Error
+mae = np.mean(np.abs(predictions_rescaled - y_test_rescaled))
+print(f"Mean Absolute Error: {mae:.2f}")
